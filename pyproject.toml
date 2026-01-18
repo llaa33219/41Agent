@@ -1,0 +1,49 @@
+[project]
+name = "41agent"
+version = "0.1.0"
+description = "Omnimodal autonomous AI agent with VM control and Inochi2d avatar"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # OpenAI-compatible client for qwen3-omni-flash
+    "openai>=1.0.0",
+    
+    # Audio processing
+    "numpy>=1.24.0",
+    "soundfile>=0.12.0",
+    "librosa>=0.10.0",
+    
+    # RAG and memory
+    "chromadb>=0.4.0",
+    "sentence-transformers>=2.2.0",
+    
+    # VM control
+    "qemu.qmp>=0.1.0",
+    "vncdotool>=1.0.0",
+    "Pillow>=10.0.0",
+    
+    # Avatar control (VMC protocol)
+    "python-osc>=1.8.0",
+    
+    # Async support
+    "asyncio>=3.4.3",
+    "aiofiles>=23.0.0",
+    
+    # UI/Display
+    "pygame>=2.5.0",
+    "opencv-python>=4.8.0",
+    
+    # Configuration
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+]

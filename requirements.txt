@@ -1,0 +1,32 @@
+# 41Agent Dependencies
+# Install with: pip install -r requirements.txt
+
+# OpenAI-compatible client for qwen3-omni-flash
+openai>=1.0.0
+
+# Audio processing
+numpy>=1.24.0
+soundfile>=0.12.0
+librosa>=0.10.0
+
+# RAG and memory
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# VM control
+Pillow>=10.0.0
+
+# Avatar control (VMC protocol)
+python-osc>=1.8.0
+
+# Async support
+asyncio>=3.4.3
+aiofiles>=23.0.0
+
+# UI/Display
+pygame>=2.5.0
+opencv-python>=4.8.0
+
+# Configuration
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
