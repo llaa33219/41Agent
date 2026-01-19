@@ -134,12 +134,25 @@ def main_entry():
         sys.exit(0)
 
     # Check if DASHSCOPE_API_KEY is set
-    if not os.getenv("DASHSCOPE_API_KEY"):
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+
+    # Also check .env file if not in environment
+    if not api_key:
+        env_path = Path(__file__).parent / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("DASHSCOPE_API_KEY="):
+                    api_key = line.split("=", 1)[1].strip()
+                    os.environ["DASHSCOPE_API_KEY"] = api_key
+                    break
+
+    if not api_key:
         print("Warning: DASHSCOPE_API_KEY not set!")
         print("Please set it before continuing:")
         print("  export DASHSCOPE_API_KEY='your-api-key'")
         print()
-        print("You can also create a .env file in the project root.")
+        print("Or create a .env file with:")
+        print("  DASHSCOPE_API_KEY=your-api-key")
         print()
         response = input("Continue anyway? (y/n): ").strip().lower()
         if response != "y":
