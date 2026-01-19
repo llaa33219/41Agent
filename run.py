@@ -3,17 +3,7 @@
 41Agent - Omnimodal Autonomous AI Agent
 
 Usage:
-    python run.py [--help]
-
-Requirements:
-    - QEMU installed (for VM functionality)
-    - Inochi2d Session running (for avatar)
-    - DashScope API key (set DASHSCOPE_API_KEY environment variable)
-
-Controls:
-    T - Toggle chat mode
-    ESC - Close chat / Exit
-    Ctrl+C - Emergency stop
+    python run.py [--help] [--headless]
 """
 
 import asyncio
@@ -64,8 +54,7 @@ def ensure_dependencies():
     if not check_uv_installed():
         print("Installing uv...")
         if not install_uv():
-            print("Failed to install uv. Please install manually:")
-            print("  curl -sSf https://uv.run | sh")
+            print("Failed to install uv.")
             sys.exit(1)
 
     # Add uv to PATH if needed
@@ -74,52 +63,41 @@ def ensure_dependencies():
     if uv_path.exists() and str(uv_home) not in os.environ.get("PATH", ""):
         os.environ["PATH"] = str(uv_home) + os.pathsep + os.environ.get("PATH", "")
 
-    print("Installing dependencies with uv...")
+    # Check if .venv already exists
+    venv_python = project_root / ".venv" / "bin" / "python"
+
+    if venv_python.exists():
+        # Check if pygame is installed
+        result = subprocess.run(
+            [str(venv_python), "-c", "import pygame"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            print("Dependencies already installed.")
+            return str(venv_python)
+        else:
+            print("Updating dependencies...")
+    else:
+        print("Creating virtual environment and installing dependencies...")
+
     result = subprocess.run(
         ["uv", "sync"],
         cwd=project_root,
         capture_output=True,
         text=True,
         env={**os.environ, "UV_NO_WRAP": "1"},
+        timeout=600,
     )
 
     if result.returncode != 0:
-        print(f"Failed to install dependencies: {result.stderr}")
+        print(f"Failed to install dependencies:")
+        print(result.stderr)
         sys.exit(1)
 
     print("Dependencies installed successfully!")
-    return True
-
-
-def run_agent():
-    """Run the main 41Agent application."""
-    project_root = Path(__file__).parent
-
-    # Check if .venv exists
-    venv_path = project_root / ".venv"
-    if venv_path.exists():
-        # Run with uv in the venv
-        python_path = venv_path / "bin" / "python"
-        result = subprocess.run(
-            [str(python_path), str(project_root / "run.py")],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "UV_NO_WRAP": "1"},
-        )
-        print(result.stdout)
-        if result.returncode != 0:
-            print(result.stderr)
-        sys.exit(result.returncode)
-    else:
-        # No venv, run directly
-        src_path = project_root / "src"
-        if str(src_path) not in sys.path:
-            sys.path.insert(0, str(src_path))
-
-        from src.orchestrator import main
-
-        asyncio.run(main())
+    return str(venv_python)
 
 
 def main_entry():
@@ -129,32 +107,41 @@ def main_entry():
     print("=" * 60)
     print()
     print("Controls:")
-    print("  T     - Toggle chat mode")
+    print("  T     - Toggle chat mode (GUI only)")
     print("  ESC   - Close chat / Exit")
     print("  Ctrl+C - Emergency stop")
     print()
-    print("Requirements:")
-    print("  - QEMU installed")
-    print("  - Inochi2d Session running on port 39540")
-    print("  - DASHSCOPE_API_KEY environment variable set")
+    print("Options:")
+    print("  --headless    Run without GUI display")
+    print("  --help        Show this message")
     print()
 
+    # Check for help flag
     if len(sys.argv) > 1 and sys.argv[1] in ["--help", "-h"]:
-        print("Usage: python run.py")
+        print("Usage: python run.py [--headless]")
         print()
         print("This script will automatically:")
         print("  1. Install uv if not present")
         print("  2. Install all dependencies")
         print("  3. Run 41Agent")
         print()
-        print("Make sure to set DASHSCOPE_API_KEY before running!")
+        print("Requirements:")
+        print("  - DASHSCOPE_API_KEY environment variable")
+        print("  - For VM: QEMU installed, disk image in assets/vm.qcow2")
+        print("  - For avatar: Inochi2d Session, avatar in assets/avatar.inx")
         sys.exit(0)
 
-    # Check if already running in venv (skip re-init)
-    running_in_venv = (
-        os.environ.get("UV_NO_WRAP") == "1"
-        or Path("/home/luke/41Agent/.venv/bin/python").exists()
-    )
+    # Check for headless mode
+    headless = "--headless" in sys.argv or os.getenv("HEADLESS", "").lower() == "true"
+
+    # Set headless mode
+    if headless:
+        os.environ["HEADLESS"] = "true"
+
+    # Check if running from venv python
+    venv_python = Path("/home/luke/41Agent/.venv/bin/python")
+    current_python = Path(sys.executable)
+    is_from_venv = venv_python.exists() and str(current_python) == str(venv_python)
 
     # Check API key
     api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -168,28 +155,34 @@ def main_entry():
                     break
 
     if not api_key:
-        print("Warning: DASHSCOPE_API_KEY not set!")
+        print("Error: DASHSCOPE_API_KEY not set!")
         print("Please set it before continuing:")
         print("  export DASHSCOPE_API_KEY='your-api-key'")
-        print()
         print("Or create a .env file with:")
         print("  DASHSCOPE_API_KEY=your-api-key")
-        print()
-        response = input("Continue anyway? (y/n): ").strip().lower()
-        if response != "y":
-            print("Exiting...")
-            sys.exit(0)
+        sys.exit(1)
+
+    # Set headless mode
+    if headless:
+        os.environ["HEADLESS"] = "true"
 
     print("Initializing 41Agent...")
     print("=" * 60)
 
-    # Ensure dependencies are installed (only if not in venv)
-    if not running_in_venv:
-        ensure_dependencies()
+    # Ensure dependencies
+    if not is_from_venv:
+        venv_python = ensure_dependencies()
+        # Run with venv python
+        new_env = {**os.environ, "HEADLESS": "true" if headless else "false"}
+        os.execve(
+            venv_python, [venv_python, str(Path(__file__))] + sys.argv[1:], new_env
+        )
 
-    # Run the agent
+    # Run the agent (only reached if already in venv)
     try:
-        run_agent()
+        from src.orchestrator import main
+
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit(0)

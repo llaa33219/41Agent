@@ -4,18 +4,17 @@ import asyncio
 import base64
 import re
 import random
+import subprocess
+import os
+import sys
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 
-import pygame
-from PIL import Image
-import io
-
 from .config import config
 from .agent import OmniAgent
 from .memory import MemoryManager
-from .vm_controller import VMController, VMScreenshot
+from .vm_controller import VMController, VMScreenshot, QEMULauncher
 from .avatar_controller import Inochi2dController, AvatarExpression
 
 
@@ -30,6 +29,7 @@ class Orchestrator:
         self.running = False
         self.chat_active = False
         self.chat_input = ""
+        self.headless = config.headless or not config.check_display()
 
         # Pygame display
         self.screen = None
@@ -39,10 +39,26 @@ class Orchestrator:
 
         # Screenshot handling
         self.last_screenshot: Optional[VMScreenshot] = None
-        self.screenshot_task: Optional[asyncio.Task] = None
+
+        # Auto-launch tracking
+        self.vm_process: Optional[subprocess.Popen] = None
+        self.inochi_process: Optional[subprocess.Popen] = None
 
     async def initialize(self):
         """Initialize all components."""
+        print(f"Mode: {'Headless' if self.headless else 'GUI'}")
+
+        if self.headless:
+            await self._initialize_headless()
+        else:
+            await self._initialize_gui()
+
+    async def _initialize_gui(self):
+        """Initialize with GUI display."""
+        import pygame
+        from PIL import Image
+        import io
+
         # Initialize pygame
         pygame.init()
         self.screen = pygame.display.set_mode(
@@ -67,18 +83,45 @@ class Orchestrator:
         self.running = True
         print("41Agent initialized and ready!")
 
+    async def _initialize_headless(self):
+        """Initialize in headless mode (no display)."""
+        print("Running in headless mode...")
+
+        # Connect to VM for control
+        vm_connected = await self.vm.connect()
+        if not vm_connected:
+            print("Warning: Could not connect to VM.")
+
+        # Initialize avatar (still works without display)
+        await self.avatar.start()
+        await self.avatar.set_expression(AvatarExpression.LISTENING)
+
+        self.running = True
+        print("41Agent initialized in headless mode!")
+
     async def run(self):
         """Main run loop."""
+        if self.headless:
+            await self._run_headless()
+        else:
+            await self._run_gui()
+
+    async def _run_gui(self):
+        """Main run loop with GUI."""
+        import pygame
+        from PIL import Image
+        import io
+
         screenshot_interval = 1.0 / config.vm_screenshot_fps
         last_screenshot_time = 0.0
 
         while self.running:
-            dt = self.clock.tick(60) / 1000.0  # 60 FPS
+            dt = self.clock.tick(60) / 1000.0
 
             # Handle events
             await self._handle_events()
 
-            # Capture screenshots at configured FPS
+            # Capture screenshots
             current_time = pygame.time.get_ticks() / 1000.0
             if current_time - last_screenshot_time >= screenshot_interval:
                 self.last_screenshot = await self.vm.get_screenshot()
@@ -90,13 +133,35 @@ class Orchestrator:
             # Autonomous behavior
             await self._autonomous_behavior()
 
-            # Process any pending AI responses
+            # Process AI responses
             await self._process_ai_responses()
+
+        await self.shutdown()
+
+    async def _run_headless(self):
+        """Main run loop in headless mode."""
+        print("Headless mode: VM and avatar are active.")
+        print("Press Ctrl+C to stop.")
+
+        while self.running:
+            await asyncio.sleep(1.0)
+
+            # Still process events
+            await self._handle_events()
+
+            # Autonomous behavior in headless
+            await self._autonomous_behavior()
 
         await self.shutdown()
 
     async def _handle_events(self):
         """Handle pygame events."""
+        if self.headless:
+            # In headless, just check for Ctrl+C
+            return
+
+        import pygame
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -122,18 +187,22 @@ class Orchestrator:
                             self.chat_input = ""
                     elif event.key == pygame.K_BACKSPACE:
                         self.chat_input = self.chat_input[:-1]
-                    elif event.key == pygame.K_LCTRL or event.key == pygame.K_RCTRL:
-                        pass  # Skip control keys
                     else:
-                        # Add character
                         if event.unicode and event.unicode.isprintable():
                             self.chat_input += event.unicode
 
     async def _render(self):
         """Render the display."""
+        if self.headless:
+            return
+
+        import pygame
+        from PIL import Image
+        import io
+
         self.screen.fill((0, 0, 0))
 
-        # Render VM screenshot if available
+        # Render VM screenshot
         if self.last_screenshot:
             try:
                 image = Image.open(io.BytesIO(self.last_screenshot.data))
@@ -142,21 +211,14 @@ class Orchestrator:
                     image.tobytes(), image.size, image.mode
                 )
                 self.screen.blit(surface, (0, 0))
-            except Exception as e:
-                # Fallback: show placeholder
-                placeholder = self.font.render(
-                    "VM Screen Capture", True, (255, 255, 255)
-                )
+            except Exception:
+                placeholder = self.font.render("VM Screen", True, (255, 255, 255))
                 self.screen.blit(
-                    placeholder, (config.ui_width // 2 - 100, config.ui_height // 2)
+                    placeholder, (config.ui_width // 2 - 50, config.ui_height // 2)
                 )
 
-        # Render avatar in bottom-right corner
-        avatar_placeholder = self.font.render(
-            f"Inochi2d Avatar ({config.avatar_width}x{config.avatar_height})",
-            True,
-            (255, 255, 255),
-        )
+        # Render avatar
+        avatar_placeholder = self.font.render("Avatar", True, (255, 255, 255))
         avatar_bg = pygame.Surface((config.avatar_width, config.avatar_height))
         avatar_bg.fill((20, 20, 40))
         self.screen.blit(
@@ -165,20 +227,18 @@ class Orchestrator:
         self.screen.blit(
             avatar_placeholder,
             (
-                config.avatar_position_x + 20,
-                config.avatar_position_y + config.avatar_height // 2 - 20,
+                config.avatar_position_x + 50,
+                config.avatar_position_y + config.avatar_height // 2,
             ),
         )
 
-        # Render chat UI if active
+        # Render chat UI
         if self.chat_active:
-            # Chat input box
             chat_bg = pygame.Surface((config.ui_width - 100, 80))
             chat_bg.fill((40, 40, 60))
             chat_bg.set_alpha(230)
             self.screen.blit(chat_bg, (50, config.ui_height - 100))
 
-            # Chat text
             chat_text = self.chat_font.render(
                 f"> {self.chat_input}"
                 + ("_" if int(pygame.time.get_ticks() / 500) % 2 else ""),
@@ -187,14 +247,8 @@ class Orchestrator:
             )
             self.screen.blit(chat_text, (70, config.ui_height - 80))
 
-            # Instructions
-            help_text = self.font.render(
-                "Press ENTER to send, ESC to close", True, (150, 150, 150)
-            )
-            self.screen.blit(help_text, (50, config.ui_height - 30))
-
-        # Render status indicator
-        status_text = f"41Agent | VM: {'Connected' if self.vm.state.value == 'running' else 'Disconnected'} | Chat: {'Active' if self.chat_active else 'Press T'}"
+        # Render status
+        status_text = f"41Agent | {'Headless' if self.headless else 'GUI'}"
         status_surface = self.font.render(status_text, True, (100, 100, 100))
         self.screen.blit(status_surface, (10, 10))
 
@@ -202,16 +256,11 @@ class Orchestrator:
 
     async def _send_message(self, message: str):
         """Send message to AI agent."""
-        # Add to working memory
         self.memory.add_to_working("user", message)
 
-        # Get contextual memory
         contextual_memory = await self.memory.get_contextual_memory(message)
-
-        # Build messages
         messages = self.memory.get_working_messages()
 
-        # Add contextual memory as system context
         if contextual_memory:
             messages.insert(
                 0,
@@ -221,12 +270,9 @@ class Orchestrator:
                 },
             )
 
-        # Start talking animation
         await self.avatar.start_talking()
 
-        # Send to AI
         response_text = ""
-        tool_calls = []
 
         async for chunk in self.agent.chat(messages):
             if chunk.get("error"):
@@ -237,48 +283,31 @@ class Orchestrator:
 
             response_text += chunk["text"]
 
-            # Check for tool calls in response
             if "<tool_call>" in response_text:
                 await self.avatar.set_expression(AvatarExpression.THINKING)
 
             if chunk.get("done"):
                 await self.avatar.stop_talking()
 
-                # Extract and process tool calls
                 tool_calls = self._extract_tool_calls(response_text)
                 if tool_calls:
                     await self._execute_tool_calls(tool_calls)
                 else:
-                    # Just a text response
                     await self.avatar.set_expression(AvatarExpression.HAPPY)
                     await self.avatar.speak_text(response_text)
 
-                # Store in memory
                 await self.memory.remember(response_text, importance=0.5)
-
-                # Add to working memory
                 self.memory.add_to_working("assistant", response_text)
-
                 break
 
     def _extract_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extract tool calls from response text.
-
-        Args:
-            text: Response text containing tool calls
-
-        Returns:
-            List of tool call dictionaries
-        """
+        """Extract tool calls from response."""
         tool_calls = []
-
-        # Pattern: <tool_call>...</tool_call>
         pattern = r"<tool_call>(.*?)</tool_call>"
         matches = re.findall(pattern, text, re.DOTALL)
 
         for match in matches:
             try:
-                # Parse tool call
                 tool_name_match = re.search(r'"name":\s*"([^"]+)"', match)
                 args_match = re.search(r'"args":\s*({.*?})', match, re.DOTALL)
 
@@ -288,7 +317,6 @@ class Orchestrator:
                         import json
 
                         tool_call["args"] = json.loads(args_match.group(1))
-
                     tool_calls.append(tool_call)
             except Exception as e:
                 print(f"Failed to parse tool call: {e}")
@@ -296,11 +324,7 @@ class Orchestrator:
         return tool_calls
 
     async def _execute_tool_calls(self, tool_calls: List[Dict[str, Any]]):
-        """Execute tool calls.
-
-        Args:
-            tool_calls: List of tool calls to execute
-        """
+        """Execute tool calls."""
         for tool_call in tool_calls:
             tool_name = tool_call["name"]
             args = tool_call.get("args", {})
@@ -310,28 +334,22 @@ class Orchestrator:
                     await self.vm.click(
                         args["x"], args.get("y", 0), args.get("button", "left")
                     )
-                    await self.memory.remember(
-                        f"Clicked at ({args['x']}, {args.get('y', 0)})", importance=0.3
-                    )
 
                 elif tool_name == "vm_type":
                     await self.vm.type_text(args["text"])
-                    await self.memory.remember(
-                        f"Typed: {args['text'][:50]}...", importance=0.3
-                    )
 
                 elif tool_name == "vm_screenshot":
                     screenshot = await self.vm.get_screenshot()
                     if screenshot:
-                        # Analyze the screenshot
                         await self._analyze_screenshot(screenshot)
 
                 elif tool_name == "vm_press_key":
                     await self.vm.press_key(args["key"])
 
                 elif tool_name == "avatar_expression":
-                    expression = AvatarExpression(args["expression"])
-                    await self.avatar.set_expression(expression)
+                    await self.avatar.set_expression(
+                        AvatarExpression(args["expression"])
+                    )
 
                 elif tool_name == "avatar_speak":
                     await self.avatar.speak_text(args["text"])
@@ -347,63 +365,51 @@ class Orchestrator:
                         print(f"Memory: {mem.content}")
 
             except Exception as e:
-                print(f"Failed to execute tool call {tool_name}: {e}")
+                print(f"Tool call failed {tool_name}: {e}")
                 await self.avatar.set_expression(AvatarExpression.SAD)
 
     async def _analyze_screenshot(self, screenshot: VMScreenshot):
-        """Analyze VM screenshot with AI.
-
-        Args:
-            screenshot: Screenshot to analyze
-        """
+        """Analyze VM screenshot with AI."""
         try:
-            # Save temporary screenshot
             temp_path = "/tmp/vm_analyze.png"
             with open(temp_path, "wb") as f:
                 f.write(screenshot.data)
 
-            # Analyze with AI
             description = await self.agent.analyze_image(temp_path)
-            print(f"Screen analysis: {description}")
-
-            # Store in memory
-            await self.memory.remember(f"Saw on screen: {description}", importance=0.4)
+            print(f"Screen: {description}")
+            await self.memory.remember(f"Saw: {description}", importance=0.4)
 
         except Exception as e:
-            print(f"Failed to analyze screenshot: {e}")
+            print(f"Screenshot analysis failed: {e}")
 
     async def _process_ai_responses(self):
-        """Process any pending AI responses (for autonomous mode)."""
-        # This handles async AI responses when agent acts autonomously
+        """Process pending AI responses."""
         pass
 
     async def _autonomous_behavior(self):
-        """Execute autonomous behaviors when not in chat mode."""
+        """Execute autonomous behaviors."""
         if self.chat_active:
             return
 
-        # Occasionally analyze screen if VM is connected
+        # Occasional screen analysis
         if self.vm.state.value == "running" and self.last_screenshot:
-            # Small chance to analyze screen autonomously
-            import random
-
-            if random.random() < 0.01:  # 1% chance per frame
+            if random.random() < 0.01:
                 await self._analyze_screenshot(self.last_screenshot)
                 await self.avatar.set_expression(AvatarExpression.THINKING)
 
-        # Return to listening after a while
-        if random.random() < 0.001:  # Occasional state reset
+        # State reset
+        if random.random() < 0.001:
             await self.avatar.set_expression(AvatarExpression.LISTENING)
 
     async def shutdown(self):
         """Shutdown all components."""
         print("Shutting down 41Agent...")
 
-        # Disconnect VM
-        await self.vm.disconnect()
-
         # Stop avatar
         await self.avatar.stop()
+
+        # Disconnect VM
+        await self.vm.disconnect()
 
         # Close memory
         await self.memory.close()
@@ -412,9 +418,47 @@ class Orchestrator:
         await self.agent.close()
 
         # Quit pygame
-        pygame.quit()
+        if not self.headless:
+            import pygame
+
+            pygame.quit()
 
         print("41Agent shutdown complete.")
+
+    async def auto_start_services(self):
+        """Auto-start VM and Inochi2d Session."""
+        # Start Inochi2d Session
+        if config.auto_start_inochi2d:
+            inochi_path = Path(config.inochi2d_session_path)
+            avatar_path = Path(config.inochi2d_avatar_path)
+
+            if inochi_path.exists() and avatar_path.exists():
+                print("Starting Inochi2d Session...")
+                self.inochi_process = subprocess.Popen(
+                    [str(inochi_path), str(avatar_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await asyncio.sleep(2)  # Wait for startup
+                print("Inochi2d Session started.")
+
+        # Start QEMU VM
+        if config.auto_start_vm:
+            disk_path = Path(config.vm_disk_path)
+            iso_path = Path(config.vm_iso_path)
+
+            if disk_path.exists() or iso_path.exists():
+                print("Starting QEMU VM...")
+                QEMULauncher.launch(
+                    disk_path=str(disk_path) if disk_path.exists() else str(iso_path),
+                    iso_path=str(iso_path) if disk_path.exists() else None,
+                    memory=config.vm_memory,
+                    cpus=config.vm_cpus,
+                    socket_path=config.qemu_socket_path,
+                    vnc_display=config.qemu_vnc_display,
+                )
+                await asyncio.sleep(3)  # Wait for VM startup
+                print("QEMU VM started.")
 
 
 async def main():
@@ -422,17 +466,20 @@ async def main():
     orchestrator = Orchestrator()
 
     try:
+        # Auto-start services
+        await orchestrator.auto_start_services()
+
+        # Initialize and run
         await orchestrator.initialize()
         await orchestrator.run()
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
         print(f"Fatal error: {e}")
-        raise
+        import traceback
+
+        traceback.print_exc()
     finally:
         if orchestrator.running:
             await orchestrator.shutdown()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

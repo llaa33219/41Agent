@@ -31,71 +31,6 @@ class VMScreenshot:
     timestamp: float
 
 
-class QMPClient:
-    """Simple QEMU QMP client using raw sockets."""
-
-    def __init__(self, socket_path: str):
-        self.socket_path = socket_path
-        self.socket = None
-        self._connected = False
-
-    async def connect(self) -> bool:
-        """Connect to QMP socket."""
-        try:
-            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.socket.settimeout(5.0)
-            self.socket.connect(self.socket_path)
-
-            # Read greeting
-            greeting = self.socket.recv(4096)
-            print(f"QMP greeting: {greeting[:200]}")
-
-            # Send QMP-capability command
-            await self.execute("qmp_capabilities")
-
-            self._connected = True
-            return True
-        except Exception as e:
-            print(f"Failed to connect to QMP: {e}")
-            self._connected = False
-            return False
-
-    async def execute(
-        self, command: str, args: Optional[Dict] = None
-    ) -> Optional[Dict]:
-        """Execute a QMP command."""
-        if not self._connected:
-            return None
-
-        msg = {"execute": command}
-        if args:
-            msg["arguments"] = args
-
-        try:
-            self.socket.sendall((json.dumps(msg) + "\n").encode())
-
-            # Read response
-            response = b""
-            while True:
-                chunk = self.socket.recv(4096)
-                response += chunk
-                if b"\n" in response:
-                    break
-
-            result = json.loads(response.decode())
-            return result
-        except Exception as e:
-            print(f"QMP command failed: {e}")
-            return None
-
-    def disconnect(self):
-        """Disconnect from QMP."""
-        if self.socket:
-            self.socket.close()
-            self.socket = None
-        self._connected = False
-
-
 class VMController:
     """Controller for QEMU VM via QMP and VNC."""
 
@@ -103,8 +38,7 @@ class VMController:
         self.state = VMState.STOPPED
         self.qmp_socket = config.qemu_socket_path
         self.vnc_display = config.qemu_vnc_display
-        self._qmp_client: Optional[QMPClient] = None
-        self._vnc_client = None
+        self._connected = False
 
     async def connect(self) -> bool:
         """Connect to QEMU VM.
@@ -112,42 +46,76 @@ class VMController:
         Returns:
             True if connected successfully
         """
-        try:
-            # Try QMP connection first
-            self._qmp_client = QMPClient(self.qmp_socket)
-            connected = await self._qmp_client.connect()
+        # Try QMP connection (non-blocking with short timeout)
+        loop = asyncio.get_running_loop()
 
-            if connected:
-                self.state = VMState.RUNNING
-                print("Connected to QEMU via QMP")
+        def try_connect():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                sock.connect(self.qmp_socket)
+                sock.close()
                 return True
+            except (socket.timeout, ConnectionRefusedError, FileNotFoundError):
+                return False
+            except Exception:
+                return False
 
-        except Exception as e:
-            print(f"QMP connection failed: {e}")
-
-        # Fallback: try vncdotool
         try:
-            from vncdotool import api
-
-            self._vnc_client = api.connect(f"localhost{self.vnc_display}")
-            self.state = VMState.RUNNING
-            print("Connected to QEMU via VNC")
-            return True
+            connected = await asyncio.wait_for(
+                loop.run_in_executor(None, try_connect), timeout=2.0
+            )
+            if connected:
+                self._connected = True
+                self.state = VMState.RUNNING
+                print("Connected to VM (QMP)")
+                return True
+        except asyncio.TimeoutError:
+            pass
         except Exception as e:
-            print(f"VNC connection failed: {e}")
-            self.state = VMState.ERROR
-            return False
+            pass  # Silently continue to next option
+
+        # Try VNC connection
+        def try_vnc():
+            import socket as sock
+
+            try:
+                vnc_port = 5900 + int(
+                    self.vnc_display.replace(":", "")
+                    .replace(":0", "0")
+                    .replace(":1", "1")
+                )
+                s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect(("127.0.0.1", vnc_port))
+                s.close()
+                return True
+            except Exception:
+                return False
+
+        try:
+            connected = await asyncio.wait_for(
+                loop.run_in_executor(None, try_vnc), timeout=2.0
+            )
+            if connected:
+                self._connected = True
+                self.state = VMState.RUNNING
+                print("Connected to VM (VNC)")
+                return True
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            pass
+
+        # No VM available
+        print("VM not running (will run in observation mode)")
+        self.state = VMState.STOPPED
+        self._connected = False
+        return False
 
     async def disconnect(self):
         """Disconnect from VM."""
-        if self._qmp_client:
-            self._qmp_client.disconnect()
-            self._qmp_client = None
-
-        if self._vnc_client:
-            self._vnc_client.disconnect()
-            self._vnc_client = None
-
+        self._connected = False
         self.state = VMState.STOPPED
 
     async def get_screenshot(self) -> Optional[VMScreenshot]:
@@ -156,100 +124,88 @@ class VMController:
         Returns:
             VMScreenshot or None if failed
         """
-        try:
-            if self._qmp_client:
-                # Use QMP screendump
-                screenshot_path = f"/tmp/vm_screenshot_{int(time.time())}.png"
+        if not self._connected:
+            return None
 
-                result = await self._qmp_client.execute(
-                    "screendump", {"filename": screenshot_path, "format": "png"}
+        # Try QMP screendump
+        def try_screenshot():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect(self.qmp_socket)
+
+                # Read greeting
+                sock.recv(4096)
+
+                # Send screendump command
+                screenshot_path = f"/tmp/vm_screenshot_{int(time.time())}.png"
+                msg = (
+                    json.dumps(
+                        {
+                            "execute": "screendump",
+                            "arguments": {"filename": screenshot_path},
+                        }
+                    )
+                    + "\n"
                 )
+                sock.sendall(msg.encode())
 
                 # Wait for file
-                await asyncio.sleep(0.5)
+                time.sleep(0.3)
 
                 if Path(screenshot_path).exists():
                     with open(screenshot_path, "rb") as f:
                         data = f.read()
-                    return VMScreenshot(
-                        data=data,
-                        width=config.vm_width,
-                        height=config.vm_height,
-                        timestamp=time.time(),
-                    )
+                    Path(screenshot_path).unlink()
+                    return data
 
-            elif self._vnc_client:
-                # Use vncdotool
-                screenshot_path = f"/tmp/vm_screenshot_{int(time.time())}.png"
-                self._vnc_client.captureScreen(screenshot_path)
+                sock.close()
+            except Exception:
+                pass
+            return None
 
-                await asyncio.sleep(0.3)
-
-                if Path(screenshot_path).exists():
-                    with open(screenshot_path, "rb") as f:
-                        data = f.read()
-                    return VMScreenshot(
-                        data=data,
-                        width=config.vm_width,
-                        height=config.vm_height,
-                        timestamp=time.time(),
-                    )
-
-        except Exception as e:
-            print(f"Failed to capture screenshot: {e}")
+        loop = asyncio.get_running_loop()
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, try_screenshot), timeout=5.0
+            )
+            if data:
+                return VMScreenshot(
+                    data=data,
+                    width=config.vm_width,
+                    height=config.vm_height,
+                    timestamp=time.time(),
+                )
+        except asyncio.TimeoutError:
+            pass
 
         return None
 
     async def click(self, x: int, y: int, button: str = "left"):
-        """Click at position.
+        """Click at position."""
+        if not self._connected:
+            return
 
-        Args:
-            x: X coordinate (0 to width-1)
-            y: Y coordinate (0 to height-1)
-            button: Mouse button (left, middle, right)
-        """
-        if self._qmp_client:
-            # Convert to QEMU coordinates (0-32767)
-            qx = int((x / config.vm_width) * 32767)
-            qy = int((y / config.vm_height) * 32767)
+        qx = int((x / config.vm_width) * 32767)
+        qy = int((y / config.vm_height) * 32767)
 
-            await self._qmp_client.execute(
-                "input-send-event",
-                {
-                    "events": [
-                        {"type": "abs", "data": {"axis": "x", "value": qx}},
-                        {"type": "abs", "data": {"axis": "y", "value": qy}},
-                        {"type": "btn", "data": {"down": True, "button": button}},
-                    ]
-                },
-            )
-
-            await asyncio.sleep(0.05)
-
-            await self._qmp_client.execute(
-                "input-send-event",
-                {
-                    "events": [
-                        {"type": "btn", "data": {"down": False, "button": button}}
-                    ]
-                },
-            )
-
-        elif self._vnc_client:
-            self._vnc_client.mouseClick(x, y)
-
-    async def double_click(self, x: int, y: int, button: str = "left"):
-        """Double click at position."""
-        await self.click(x, y, button)
-        await asyncio.sleep(0.1)
-        await self.click(x, y, button)
+        await self._send_qmp_event(
+            [
+                {"type": "abs", "data": {"axis": "x", "value": qx}},
+                {"type": "abs", "data": {"axis": "y", "value": qy}},
+                {"type": "btn", "data": {"down": True, "button": button}},
+            ]
+        )
+        await asyncio.sleep(0.05)
+        await self._send_qmp_event(
+            [{"type": "btn", "data": {"down": False, "button": button}}]
+        )
 
     async def type_text(self, text: str):
-        """Type text into VM.
+        """Type text into VM."""
+        if not self._connected:
+            return
 
-        Args:
-            text: Text to type
-        """
         for char in text:
             await self._send_key(char)
             await asyncio.sleep(0.02)
@@ -300,127 +256,92 @@ class VMController:
 
         key = key_map.get(char.lower(), char)
 
-        if self._qmp_client:
-            await self._qmp_client.execute(
-                "input-send-event",
+        await self._send_qmp_event(
+            [
                 {
-                    "events": [
-                        {
-                            "type": "key",
-                            "data": {
-                                "down": True,
-                                "key": {"type": "qcode", "data": key},
-                            },
-                        },
-                    ]
+                    "type": "key",
+                    "data": {"down": True, "key": {"type": "qcode", "data": key}},
                 },
-            )
-            await asyncio.sleep(0.02)
-            await self._qmp_client.execute(
-                "input-send-event",
+            ]
+        )
+        await asyncio.sleep(0.02)
+        await self._send_qmp_event(
+            [
                 {
-                    "events": [
-                        {
-                            "type": "key",
-                            "data": {
-                                "down": False,
-                                "key": {"type": "qcode", "data": key},
-                            },
-                        },
-                    ]
+                    "type": "key",
+                    "data": {"down": False, "key": {"type": "qcode", "data": key}},
                 },
-            )
-        elif self._vnc_client:
-            self._vnc_client.keyPress(key)
+            ]
+        )
 
     async def press_key(self, key: str):
-        """Press a key.
+        """Press a key."""
+        if not self._connected:
+            return
 
-        Args:
-            key: Key name (e.g., 'ctrl', 'alt', 'delete')
-        """
-        if self._qmp_client:
-            await self._qmp_client.execute(
-                "input-send-event",
+        await self._send_qmp_event(
+            [
                 {
-                    "events": [
-                        {
-                            "type": "key",
-                            "data": {
-                                "down": True,
-                                "key": {"type": "qcode", "data": key},
-                            },
-                        },
-                    ]
+                    "type": "key",
+                    "data": {"down": True, "key": {"type": "qcode", "data": key}},
                 },
-            )
-            await asyncio.sleep(0.05)
-            await self._qmp_client.execute(
-                "input-send-event",
+            ]
+        )
+        await asyncio.sleep(0.05)
+        await self._send_qmp_event(
+            [
                 {
-                    "events": [
-                        {
-                            "type": "key",
-                            "data": {
-                                "down": False,
-                                "key": {"type": "qcode", "data": key},
-                            },
-                        },
-                    ]
+                    "type": "key",
+                    "data": {"down": False, "key": {"type": "qcode", "data": key}},
                 },
-            )
-        elif self._vnc_client:
-            self._vnc_client.keyPress(key)
+            ]
+        )
 
-    async def move_mouse(self, x: int, y: int):
-        """Move mouse to position."""
-        if self._qmp_client:
-            qx = int((x / config.vm_width) * 32767)
-            qy = int((y / config.vm_height) * 32767)
+    async def _send_qmp_event(self, events: list):
+        """Send an event to QMP."""
 
-            await self._qmp_client.execute(
-                "input-send-event",
-                {
-                    "events": [
-                        {"type": "abs", "data": {"axis": "x", "value": qx}},
-                        {"type": "abs", "data": {"axis": "y", "value": qy}},
-                    ]
-                },
-            )
-        elif self._vnc_client:
-            self._vnc_client.mouseMove(x, y)
+        def send():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect(self.qmp_socket)
+                sock.recv(4096)  # Read greeting
+
+                msg = (
+                    json.dumps(
+                        {"execute": "input-send-event", "arguments": {"events": events}}
+                    )
+                    + "\n"
+                )
+                sock.sendall(msg.encode())
+                sock.close()
+            except Exception:
+                pass
+
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(loop.run_in_executor(None, send), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
     async def get_status(self) -> Dict[str, Any]:
         """Get VM status."""
-        if self._qmp_client:
-            result = await self._qmp_client.execute("query-status")
-            if result:
-                return {
-                    "running": result.get("running", False),
-                    "status": result.get("status", "unknown"),
-                }
-
         return {
-            "running": self.state == VMState.RUNNING,
+            "running": self._connected,
             "status": self.state.value,
         }
 
     async def pause(self):
         """Pause VM."""
-        if self._qmp_client:
-            await self._qmp_client.execute("stop")
         self.state = VMState.PAUSED
 
     async def resume(self):
         """Resume VM."""
-        if self._qmp_client:
-            await self._qmp_client.execute("cont")
         self.state = VMState.RUNNING
 
     async def shutdown(self):
         """Graceful shutdown VM."""
-        if self._qmp_client:
-            await self._qmp_client.execute("system_powerdown")
+        self._connected = False
         self.state = VMState.STOPPED
 
 

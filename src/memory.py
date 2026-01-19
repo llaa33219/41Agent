@@ -209,7 +209,8 @@ class MemoryStore:
 
     async def close(self):
         """Close the database."""
-        self.client.close()
+        # ChromaDB doesn't require explicit closing
+        pass
 
 
 class WorkingMemory:
